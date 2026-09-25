@@ -6,7 +6,7 @@ import java.time.LocalDate
 
 object Main {
 
-  // ordine canonico per non contare (A,B) e (B,A) come coppie diverse
+  // ordine canonico per non avere (A,B) e (B,A) come coppie diverse
   def canonicalPair(a: Coord, b: Coord): CoordPair =
     if (a._1 < b._1 || (a._1 == b._1 && a._2 <= b._2)) (a, b) else (b, a)
 
@@ -19,15 +19,28 @@ object Main {
         j <- (i + 1) until locs.length
       } yield (canonicalPair(locs(i), locs(j)), date)
     }
+    val pairCounts: RDD[(CoordPair, Long)] =
+      pairsPerDate.map { case (pair, _) => (pair, 1L) }
+        .reduceByKey(_ + _)
 
-    val pairDates: RDD[(CoordPair, Set[LocalDate])] =
+    val (winningPair, _) = pairCounts.max()(Ordering.by(_._2))
+    val winningDates: List[LocalDate] =
+      pairsPerDate.filter(_._1 == winningPair)
+        .map(_._2)
+        .distinct()
+        .collect()
+        .toList
+        .sorted
+    (winningPair, winningDates)
+
+    /*val pairDates: RDD[(CoordPair, Set[LocalDate])] =
       pairsPerDate.aggregateByKey(Set.empty[LocalDate])(
         (s, d) => s + d,
         (s1, s2) => s1 ++ s2
       )
 
     val best = pairDates.max()(Ordering.by((_: (CoordPair, Set[LocalDate]))._2.size))
-    (best._1, best._2.toList.sorted)
+    (best._1, best._2.toList.sorted)*/
   }
 
   // ---------- Approccio STRIPES ----------
@@ -68,7 +81,7 @@ object Main {
       .appName("Earthquake Application")
       .master(sys.env.getOrElse("SPARK_MASTER", "local[*]"))
       //.master("local[*]") //in locala usando tutti i core della cpu
-      .config("spark.sql.shuffle.partitions", "8") // molto meno di 200 per un run locale piccolo
+      //.config("spark.sql.shuffle.partitions", "8") // molto meno di 200 per un run locale piccolo
       .getOrCreate() //crea la sessione (se non esiste)
     spark.sparkContext.setLogLevel("WARN")
     println("Spark è partito correttamente!")
