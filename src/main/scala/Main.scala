@@ -1,153 +1,119 @@
-import org.apache.spark.sql.SparkSession
-import Types.{Coord, CoordPair, EarthquakeType}
+import Types.{Coord, CoordPair}
 import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.storage.StorageLevel
 
 import java.time.LocalDate
 
 object Main {
 
-  // ordine canonico per non avere (A,B) e (B,A) come coppie diverse
-  def canonicalPair(a: Coord, b: Coord): CoordPair =
-    if (a._1 < b._1 || (a._1 == b._1 && a._2 <= b._2)) (a, b) else (b, a)
+  // Massimo per co-occorrenze; a parità vince la coppia minore (risultato deterministico)
+  private def best(x: (CoordPair, Long), y: (CoordPair, Long)): (CoordPair, Long) =
+    if (x._2 > y._2 || (x._2 == y._2 && Ordering[CoordPair].lt(x._1, y._1))) x else y
+
+  private def mergeStripes(m1: Map[Coord, Long], m2: Map[Coord, Long]): Map[Coord, Long] = {
+    val (big, small) = if (m1.size >= m2.size) (m1, m2) else (m2, m1)
+    small.foldLeft(big) { case (acc, (k, v)) => acc.updated(k, acc.getOrElse(k, 0L) + v) }
+  }
 
   // ---------- Approccio PAIRS ----------
-  def runPairs(byDate: RDD[(LocalDate, Iterable[Coord])]): (CoordPair, List[LocalDate]) = {
-    val pairsPerDate: RDD[(CoordPair, LocalDate)] = byDate.flatMap { case (date, locsIt) =>
-      val locs = locsIt.toArray
-      for {
-        i <- locs.indices
-        j <- (i + 1) until locs.length
-      } yield (canonicalPair(locs(i), locs(j)), date)
-    }
-    val pairCounts: RDD[(CoordPair, Long)] =
-      pairsPerDate.map { case (pair, _) => (pair, 1L) }
-        .reduceByKey(_ + _)
-
-    val (winningPair, _) = pairCounts.max()(Ordering.by(_._2))
-    val winningDates: List[LocalDate] =
-      pairsPerDate.filter(_._1 == winningPair)
-        .map(_._2)
-        .distinct()
-        .collect()
-        .toList
-        .sorted
-    (winningPair, winningDates)
-
-    /*val pairDates: RDD[(CoordPair, Set[LocalDate])] =
-      pairsPerDate.aggregateByKey(Set.empty[LocalDate])(
-        (s, d) => s + d,
-        (s1, s2) => s1 ++ s2
-      )
-
-    val best = pairDates.max()(Ordering.by((_: (CoordPair, Set[LocalDate]))._2.size))
-    (best._1, best._2.toList.sorted)*/
+  // Le località di un giorno sono ordinate, quindi (locs(i), locs(j)) con i<j è già canonica
+  def runPairs(byDate: RDD[(LocalDate, Array[Coord])], p: Int): (CoordPair, Long) = {
+    val counts: RDD[(CoordPair, Long)] = byDate.flatMap { case (_, locs) =>
+      Iterator.range(0, locs.length).flatMap { i =>
+        Iterator.range(i + 1, locs.length).map(j => ((locs(i), locs(j)), 1L))
+      }
+    }.reduceByKey(_ + _, p)
+    counts.reduce(best)
   }
 
   // ---------- Approccio STRIPES ----------
-  def runStripes(byDate: RDD[(LocalDate, Iterable[Coord])]): (CoordPair, List[LocalDate]) = {
-    val stripes: RDD[(Coord, Map[Coord, Set[LocalDate]])] = byDate.flatMap { case (date, locsIt) =>
-      val locs = locsIt.toArray
-      for {
-        i <- locs.indices
-        j <- locs.indices if i != j
-        (a, b) = canonicalPair(locs(i), locs(j)) if a == locs(i) // solo direzione canonica
-      } yield (a, Map(b -> Set(date)))
-    }
+  def runStripes(byDate: RDD[(LocalDate, Array[Coord])], p: Int): (CoordPair, Long) = {
+    val stripes: RDD[(Coord, Map[Coord, Long])] = byDate.flatMap { case (_, locs) =>
+      Iterator.range(0, locs.length - 1).map { i =>
+        (locs(i), Iterator.range(i + 1, locs.length).map(j => locs(j) -> 1L).toMap)
+      }
+    }.reduceByKey(mergeStripes _, p)
 
-    val merged: RDD[(Coord, Map[Coord, Set[LocalDate]])] = stripes.reduceByKey { (m1, m2) =>
-      (m1.keySet ++ m2.keySet).map { k =>
-        k -> (m1.getOrElse(k, Set.empty) ++ m2.getOrElse(k, Set.empty))
-      }.toMap
-    }
-
-    val flattened: RDD[(CoordPair, Set[LocalDate])] = merged.flatMap { case (a, m) =>
-      m.map { case (b, dates) => ((a, b), dates) }
-    }
-
-    val best = flattened.max()(Ordering.by((_: (CoordPair, Set[LocalDate]))._2.size))
-    (best._1, best._2.toList.sorted)
+    stripes.flatMap { case (a, m) =>
+      m.iterator.map { case (b, cnt) => ((a, b), cnt) }
+    }.reduce(best)
   }
+
+  private def fmt(c: Coord): String = s"(${c._1}, ${c._2})"
 
   def main(args: Array[String]): Unit = {
     if (args.length < 2) {
-      System.err.println("Uso: EarthquakeApp <input_path> <approach: pairs|stripes> [num_partitions]")
+      System.err.println("Uso: Main <input_path> <pairs|stripes> [num_partitions]")
       System.exit(1)
     }
     val inputPath = args(0)
-    val approach = args(1)
+    val approach  = args(1).toLowerCase
     val numPartitionsOpt = if (args.length > 2) Some(args(2).toInt) else None
 
+    if (approach != "pairs" && approach != "stripes") {
+      System.err.println(s"Approccio sconosciuto: $approach (usa pairs o stripes)")
+      System.exit(1)
+    }
+
+    // Master non impostato nel codice: lo decide spark-submit / Dataproc.
     val spark = SparkSession.builder()
       .appName("Earthquake Application")
       .master(sys.env.getOrElse("SPARK_MASTER", "local[*]"))
-      //.master("local[*]") //in locala usando tutti i core della cpu
-      //.config("spark.sql.shuffle.partitions", "8") // molto meno di 200 per un run locale piccolo
-      .getOrCreate() //crea la sessione (se non esiste)
+      .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+      .getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
-    println("Spark è partito correttamente!")
-    println(s"Versione di Spark: ${spark.version}")
 
+    val tStart = System.currentTimeMillis()
 
-    //LOAD CSV INTO RDD
-    //val filename = "dataset-earthquakes-trimmed.csv"
-    var data = spark
-      .read
+    var rows = spark.read
       .option("header", value = true)
-      .csv(inputPath) //load csv data
+      .csv(inputPath)
+      .select("date", "latitude", "longitude")
       .rdd
-    /*.map(Earthquake.parseRow)
-      .distinct() //remove duplicates
-      .repartition(numPartitions) //set required num of partition
-  */
-    numPartitionsOpt.foreach { n => data = data.repartition(n) }
+    numPartitionsOpt.foreach(n => rows = rows.repartition(n))
 
-    val totalRows = data.count()
+    val p = numPartitionsOpt.getOrElse(rows.getNumPartitions)
 
-    val events: RDD[EarthquakeType] =
-      data.flatMap(Earthquake.parseRow).distinct() // <-- dedup post-arrotondamento
+    // Il TUO parser; un solo shuffle; dedup (stessa cella, stesso giorno) dentro il gruppo
+    val byDate: RDD[(LocalDate, Array[Coord])] =
+      rows.flatMap(Earthquake.parseRow)
+        .groupByKey(p)
+        .mapValues(_.toArray.distinct.sorted)
+        .filter(_._2.length > 1)
+        .persist(StorageLevel.MEMORY_AND_DISK)
 
-    events.persist()
-    val nEvents = totalRows // opzionale: log dello scarto
-    val nParsed = events.count()
-    println(s"[INFO] Righe lette: $totalRows, eventi distinti (data, loc) validi: $nParsed")
+    val nDays = byDate.count() // materializza byDate
+    val tPrepared = System.currentTimeMillis()
 
-    //data.cache()
-    /*val counts = data
-      .map(ev => (ev._1, 1))
-      .reduceByKey(_ + _)
-
-    val top5 = counts.sortBy(_._2, ascending = false).take(5)
-    top5.foreach(println)*/
-    // --- 2. Raggruppamento per data ---
-    val byDate: RDD[(LocalDate, Iterable[Coord])] =
-      events.map { case (date, loc) => (date, loc) }.groupByKey()
-
-    val locsPerDate = byDate.mapValues(_.size)
-    val maxLocs = locsPerDate.values.max()
-    val avgLocs = locsPerDate.values.sum().toDouble / locsPerDate.count()
-    println(s"[INFO] Max località in un giorno: $maxLocs, media: $avgLocs")
-
-    val startTime = System.currentTimeMillis()
-
-    val result: (CoordPair, List[LocalDate]) = approach.toLowerCase match {
-      case "pairs" => runPairs(byDate)
-      case "stripes" => runStripes(byDate)
-      case other =>
-        System.err.println(s"Approccio sconosciuto: $other")
-        spark.stop()
-        System.exit(1)
-        throw new IllegalStateException()
+    if (nDays == 0) {
+      println("Nessun giorno con almeno 2 località distinte: nessuna coppia.")
+      spark.stop()
+      return
     }
 
-    val elapsed = System.currentTimeMillis() - startTime
-    println(s"[INFO] Tempo elaborazione (solo fase co-occorrenza): ${elapsed} ms")
+    val stats = byDate.map(_._2.length.toDouble).stats()
+    println(f"[INFO] Giorni con coppie: $nDays, max località/giorno: ${stats.max}%.0f, media: ${stats.mean}%.2f")
 
-    // --- 3. Output ---
-    val ((locA, locB), dates) = result
-    println(s"(($locA), ($locB))")
+    val ((locA, locB), count) = approach match {
+      case "pairs" => runPairs(byDate, p)
+      case _       => runStripes(byDate, p)
+    }
+
+    // Date vincenti: controllo O(n) per giorno, senza rigenerare le coppie
+    val dates: Array[LocalDate] = byDate
+      .filter { case (_, l) => l.contains(locA) && l.contains(locB) }
+      .keys.collect().sorted
+
+    val tEnd = System.currentTimeMillis()
+    println(s"[INFO] Preparazione (lettura+raggruppamento): ${tPrepared - tStart} ms")
+    println(s"[INFO] Co-occorrenza + date:                  ${tEnd - tPrepared} ms")
+    println(s"[INFO] Totale:                                ${tEnd - tStart} ms")
+    println(s"[INFO] Co-occorrenze della coppia vincente: $count")
+
+    println(s"(${fmt(locA)}, ${fmt(locB)})")
     dates.foreach(println)
 
     spark.stop()
-
   }
 }
