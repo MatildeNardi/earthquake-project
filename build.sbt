@@ -8,7 +8,9 @@ lazy val root = (project in file("."))
       "org.apache.spark" %% "spark-core" % "3.5.1",
       "org.apache.spark" %% "spark-sql"  % "3.5.1"
     ),
+    // Solo per l'esecuzione locale con "sbt run"
     fork := true,
+    envVars := Map("LOCAL" -> "1"),
     javaOptions ++= Seq(
       "-Xmx6g",              // adatta alla RAM disponibile sul tuo PC
       "--add-opens=java.base/java.lang=ALL-UNNAMED",
@@ -25,6 +27,5 @@ lazy val root = (project in file("."))
       "--add-opens=java.base/sun.security.action=ALL-UNNAMED",
       "--add-opens=java.base/sun.util.calendar=ALL-UNNAMED"
 
-      // ... resto invariato
     )
   )
