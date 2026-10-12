@@ -1,270 +1,129 @@
-import Types.{Cooccurrency, Coord, CoordPair, EarthquakeType}
+import Types.{Coord, CoordPair, CoordsByDate, Events}
 import org.apache.spark.rdd.RDD
+import org.apache.spark.storage.StorageLevel
 
 import java.time.LocalDate
-import scala.math.Ordering.Implicits.infixOrderingOps
+import scala.collection.mutable.ArrayBuffer
 
 
+object CooccurrencyAnalysis {
 
-/*
-trait CooccurrencyAnalysis {
-  def createPairs(data: RDD[EarthquakeType]): RDD[(CoordPair, List[LocalDate])]
+  // Massimo per co-occorrenze; a parità vince la coppia minore (risultato deterministico)
+  private def best(x: (CoordPair, Long), y: (CoordPair, Long)): (CoordPair, Long) =
+    if (x._2 > y._2 || (x._2 == y._2 && Ordering[CoordPair].lt(x._1, y._1))) x else y
 
-  def analyze(data: RDD[EarthquakeType]): Cooccurrency ={
-    val (winningPair, winningDates, winningCount) = createPairs(data)
-      .reduceByKey(_++_) //creation of list of dates in order to compute the size (co-occurrency)
-      .map{ case (pair, dateList) => (pair, dateList, dateList.size)} //added the number of co-occurrency
-      .reduce { (pairA, pairB) =>
-        if (pairA._3 > pairB._3) pairA else pairB
-      }
-    (winningPair, winningDates.sorted, winningCount)
-  }
-
-  def analyzeOptimize(data: RDD[EarthquakeType]): Cooccurrency = {
-    val pairs_data = createPairs(data)
-    val count_data = pairs_data
-      .map{ case (pair, _) => (pair, 1L) }
-      .reduceByKey(_+_)
-
-    val (winningPair, winningCount) = count_data.reduce { (elem1, elem2) =>
-      if (elem1._2 > elem2._2) elem1 else elem2
+  // ---------- Raggruppamento per giorno (varianti da confrontare) ----------
+  // distinct elimina i duplicati dovuti all'arrotondamento; sorted evita coppie speculari (A,B)/(B,A).
+  // I giorni con meno di 2 celle non producono coppie e vengono scartati.
+  def groupByDate(events: Events, grouping: String): CoordsByDate = {
+    val grouped: CoordsByDate = grouping match {
+      case "aggregate" =>
+        events.aggregateByKey(ArrayBuffer.empty[Coord])(
+          (buf, c) => buf += c,
+          (b1, b2) => b1 ++= b2
+        ).mapValues(_.toArray.distinct.sorted)
+      case "combine" =>
+        events.combineByKey(
+          (c: Coord) => ArrayBuffer(c),
+          (buf: ArrayBuffer[Coord], c: Coord) => buf += c,
+          (b1: ArrayBuffer[Coord], b2: ArrayBuffer[Coord]) => b1 ++= b2
+        ).mapValues(_.toArray.distinct.sorted)
+      case "distinct" => // duplicati eliminati PRIMA dello shuffle
+        events.distinct().groupByKey().mapValues(_.toArray.sorted)
+      case _ => // "groupby"
+        events.groupByKey().mapValues(_.toArray.distinct.sorted)
     }
-
-    val winningDates = pairs_data.lookup(winningPair).flatten.toList.sorted
-
-    (winningPair, winningDates, winningCount.toInt)
-
+    grouped.filter(_._2.length > 1)
   }
 
-  def takeMaxWithMax(data: RDD[Cooccurrency]): Cooccurrency = {
-    implicit val ord: Ordering[Cooccurrency] = Ordering.by[Cooccurrency, Int](_._3)
-    val (winningPair, winningDates, winningCount) = data.max()
-    (winningPair, winningDates.sorted, winningCount)
-  }
 
-}
 
-object GrouByApproach extends CooccurrencyAnalysis {
-  def createPairs(data: RDD[EarthquakeType]): RDD[(CoordPair, List[LocalDate])] = {
-    data
-      .groupByKey() //all (lon, lat) for each date => (date, ((lon1, lat1), ..., (lon, lat)))
-      .flatMap { case (date, cells) =>
-        //all pair combination => returns all combinations of type (((lon,lat), (lon, lat)), date)
-        //coordinates and date are inverted in order to reduce by same pair of coordinates
-        //sortBy used to avoid creation of distinct pairs like (A,B) and (B,A)=> combinations create pair (A, B) based on the sorted Seq if for a different day, B comes first than A, it creates the pair (B,A)
-        cells.toSeq.sorted.combinations(2).map { case Seq(coordsA, coordsB) => ((coordsA, coordsB), List(date)) }
+  // ---------------------------------------------------------------------------
+  // Approccio 1: PAIRS
+  // Per ogni giorno tutte le coppie (A,B) con A<B, contate con reduceByKey.
+  // ---------------------------------------------------------------------------
+
+  // Per ogni giorno tutte le coppie (A,B) con A<B, contate con reduceByKey.
+  def runPairs(byDate: CoordsByDate): (CoordPair, Long) =
+    byDate.flatMap { case (_, coords) =>
+      Iterator.range(0, coords.length - 1).flatMap { i =>
+        val a = coords(i)
+        Iterator.range(i + 1, coords.length).map(j => ((a, coords(j)), 1L))
       }
-  }
-}
+    }.reduceByKey(_ + _).reduce(best)
 
-object ReduceApproach extends CooccurrencyAnalysis {
-  def createPairs(data: RDD[EarthquakeType]): RDD[(CoordPair, List[LocalDate])] = {
-    //reduceByKey computes local intermediary data and communicates across the network only such data
-    //Therefore, it is more efficient than groupByKey: shuffles at most one pair per key from each node
-    data
-      .map{ case (date, coords) => (date, Array(coords))} //per la reduce serve che coords sia già una lista altrimenti i tipi non combaciano
-      .reduceByKey(_++_)
-      .flatMap{case (date, coordList) =>
-        coordList.sorted.combinations(2).map{ case List(coordsA, coordsB) => ((coordsA, coordsB), List(date))}
+
+
+  // ---------------------------------------------------------------------------
+  // Approccio 2: STRIPES
+  // Per ogni giorno e cella A una mappa {B -> 1}; le mappe della stessa A si fondono con reduceByKey.
+  // ---------------------------------------------------------------------------
+
+  private def mergeStripes(m1: Map[Coord, Long], m2: Map[Coord, Long]): Map[Coord, Long] = {
+    val (big, small) = if (m1.size >= m2.size) (m1, m2) else (m2, m1)
+    small.foldLeft(big) { case (acc, (k, v)) => acc.updated(k, acc.getOrElse(k, 0L) + v) }
+  }
+
+  def runStripes(byDate: CoordsByDate): (CoordPair, Long) = {
+    val stripes: RDD[(Coord, Map[Coord, Long])] = byDate.flatMap { case (_, locs) =>
+      Iterator.range(0, locs.length - 1).map { i =>
+        (locs(i), Iterator.range(i + 1, locs.length).map(j => (locs(j), 1L)).toMap)
       }
-  }
-}
+    }.reduceByKey((m1, m2) => mergeStripes(m1, m2))
 
-object FoldApproach extends CooccurrencyAnalysis {
-  def createPairs(data: RDD[EarthquakeType]): RDD[(CoordPair, List[LocalDate])] ={
-    data
-      .map{ case (date, coords) => (date, List(coords))}
-      .foldByKey(List.empty[Coord])(_++_)
-      .flatMap{case (date, coordList) =>
-        coordList.sorted.combinations(2).map{ case List(coordsA, coordsB) => ((coordsA, coordsB), List(date))}
-      }
-
-  }
-}
-
-object SelfJoinApproach extends CooccurrencyAnalysis {
-  def createPairs(data: RDD[EarthquakeType]): RDD[(CoordPair, List[LocalDate])] = {
-    data
-      .join(data)
-      .filter{ case (_, (coordA, coordB)) => coordB < coordA} //remove specular and equal coordinates created by join
-      .map ( eq => (eq._2, List(eq._1)))
-  }
-}
-
-object AggregateApproach extends CooccurrencyAnalysis {
-  def createPairs(data: RDD[EarthquakeType]): RDD[(CoordPair, List[LocalDate])] = {
-    data
-      .aggregateByKey(List.empty[Coord])(
-        (acc, coord) => coord :: acc, // aggiungi un valore all'accumulatore locale
-        (acc1, acc2) => acc1 ++ acc2 // unisci accumulatori tra partizioni
-      )
-      .flatMap { case (date, coordList) =>
-        coordList.sorted.combinations(2).map { case List(coordsA, coordsB) => ((coordsA, coordsB), List(date)) }
-      }
-  }
-}
-
-object CombineApproach extends CooccurrencyAnalysis {
-  def createPairs(data: RDD[EarthquakeType]): RDD[(CoordPair, List[LocalDate])] = {
-    data
-      .combineByKey(
-        (coord: Coord) => List(coord),  // creazione primo accumulatore
-        (acc: List[Coord], coord: Coord) => coord :: acc, // merge valore→accumulatore
-        (acc1: List[Coord], acc2: List[Coord]) => acc1 ++ acc2   // merge accumulatore↔accumulatore
-      )
-      .flatMap { case (date, coordList) =>
-        coordList.sorted.combinations(2).map { case List(coordsA, coordsB) => ((coordsA, coordsB), List(date)) }
-      }
-  }
-}
-
-object ByDateApproach extends CooccurrencyAnalysis {
-  def createPairs(data: RDD[EarthquakeType]): RDD[(CoordPair, List[LocalDate])] = {
-    val cellDates = data
-      .map{ case (date, coords) => (coords, List(date))} //per la reduce serve che coords sia già una lista altrimenti i tipi non combaciano
-      .reduceByKey(_++_) //(coords, all dates of earthquake)
-
-    cellDates
-      .cartesian(cellDates)    // RDD[((Coord, List[LocalDate]), (Coord, List[LocalDate]))]
-      .filter { case ((coordA, _), (coordB, _)) => coordA < coordB }  // tieni solo una direzione, escludi coppia con se stessa
-      .map { case ((coordA, datesA), (coordB, datesB)) =>
-        ((coordA, coordB), datesA.intersect(datesB))  // date in comune tra le due celle
-      }
-  }
-}
-
-object FastApproach {
-
-  // Genera tutte le coppie di un array di coordinate SENZA usare .combinations
-  // (doppio ciclo manuale su indici: molto più veloce del metodo generico di Scala)
-  private def pairsOf(cells: Array[Coord]): Iterator[CoordPair] = {
-    val sorted = cells.sorted // servono ordinate per evitare coppie speculari (A,B)/(B,A)
-    for {
-      i <- (0 until  sorted.length).iterator
-      j <- (i + 1 until sorted.length).iterator
-    } yield (sorted(i), sorted(j))
+    stripes.flatMap { case (a, m) =>
+      m.iterator.map { case (b, cnt) => ((a, b), cnt) }
+    }.reduce(best)
   }
 
-  def analyze(data: RDD[EarthquakeType]): Cooccurrency = {
+  /* ---------------------------------------------------------------------------
+   APPROCCIO PRUNING
+   Regola: count(A,B) <= min(freq(A), freq(B)), dove freq(X) = giorni in cui compare X.
+   1) freq di ogni cella
+   2) c0 = miglior coppia tra le k celle più frequenti (limite inferiore del massimo)
+   3) tengo solo le celle con freq >= c0  4) restituisco gli eventi distinti delle celle sopravvissute
+   ---------------------------------------------------------------------------*/
 
-    // Fase 0: raggruppa le celle per data.
-    // groupByKey usa CompactBuffer internamente: più efficiente di reduceByKey(_++_) per accumulare collezioni
-    val perDate: RDD[(LocalDate, Array[Coord])] =
-      data.groupByKey().mapValues(_.toArray.distinct)
+  def pruneEvents(events: Events, grouping: String, k: Int): Events = {
+    //remove duplicates
+    val unique = events.distinct().persist(StorageLevel.MEMORY_AND_DISK)
 
-    perDate.persist() // la useremo due volte (fase 1 e fase 2): evitiamo di ricalcolarla (vedi slide su laziness)
+    //compute frequency for each coordinate
+    val freq: RDD[(Coord, Long)] = unique
+      .map { case (_, c) => (c, 1L) } //from (date, coord) a (coord, 1)
+      .reduceByKey(_ + _) //count how many times a coord is present -> frequency
+      .persist(StorageLevel.MEMORY_AND_DISK)
 
-    // Fase 1: SOLO conteggio. Nessuna lista di date viene shufflata: solo (coppia, Long).
-    // Questo minimizza il volume di dati scambiato in rete.
-    val counts: RDD[(CoordPair, Long)] =
-      perDate
-        .flatMap { case (_, cells) => pairsOf(cells).map(p => (p, 1L)) }
-        .reduceByKey(_ + _)
+    //select the first k element ordered by frequency
+    val topSet: Set[Coord] =
+      freq.top(k)(Ordering.by[(Coord, Long), Long](_._2)).map(_._1).toSet
 
-    val (winningPair, winningCount) = counts.reduce { (a, b) =>
-      if (a._2 > b._2) a else b
-    }
+    val topByDate = groupByDate(unique.filter { case (_, c) => topSet.contains(c) }, grouping)
+    val c0 = if (topByDate.isEmpty()) 0L else runPairs(topByDate)._2
 
-    // Fase 2: SOLO per la coppia vincente, ripeschiamo le date.
-    // Non generiamo più tutte le combinazioni: filtriamo direttamente le date
-    // in cui entrambe le coordinate della coppia vincente sono presenti.
-    val (coordA, coordB) = winningPair
-    val winningDates: List[LocalDate] =
-      perDate
-        .filter { case (_, cells) => cells.contains(coordA) && cells.contains(coordB) }
-        .map(_._1)
-        .collect()
-        .toList
-        .sorted
+    val keep: Set[Coord] = freq.filter(_._2 >= c0).keys.collect().toSet
+    println(s"[INFO] Pruning: c0=$c0, celle ${freq.count()} -> ${keep.size}")
 
-    perDate.unpersist()
+    val result = unique.filter { case (_, c) => keep.contains(c) }
+      .persist(StorageLevel.MEMORY_AND_DISK)
+    result.count() // materializza result prima di liberare unique e freq
+    freq.unpersist()
+    unique.unpersist()
+    result
+  }
 
-    (winningPair, winningDates, winningCount.toInt)
+
+  def run(events: Events, grouping: String, approach: String): (CoordPair, Long, Array[LocalDate]) = {
+
+    val data  =  if (approach == "pruned")  pruneEvents(events, grouping, 200) else events
+
+    val byDate = groupByDate(data, grouping).persist(StorageLevel.MEMORY_AND_DISK)
+    val (pair, count) = if (approach == "stripes") runStripes(byDate) else runPairs(byDate)
+
+    val dates = byDate.filter { case (_, coords) => coords.contains(pair._1) && coords.contains(pair._2) }
+      .keys.collect().sortBy(_.toEpochDay)
+
+    // Risultato di un approccio: coppia vincente, co-occorrenze, date in ordine crescente
+    (pair, count, dates)
   }
 }
-*/
-
-/*
-import Types.{Cooccurrency, Coord, CoordPair, EarthquakeType}
-import org.apache.spark.rdd.RDD
-import java.time.LocalDate
-object PairsUtil extends Serializable {
-  // Genera le coppie di un array SENZA usare List.combinations (più leggero)
-  def pairsOf(cells: Array[Coord]): Iterator[CoordPair] = {
-    val sorted = cells.distinct.sorted
-    for {
-      i <- (0 until sorted.length).iterator
-      j <- (i + 1 until sorted.length).iterator
-    } yield (sorted(i), sorted(j))
-  }
-}
-
-trait CooccurrencyAnalysis {
-
-  // Ogni approccio implementa SOLO questo: come raggruppare le celle per data
-  def groupCells(data: RDD[EarthquakeType]): RDD[(LocalDate, Array[Coord])]
-
-  def analyze(data: RDD[EarthquakeType]): Cooccurrency = {
-    val perDate = groupCells(data)
-    perDate.persist() // riusata due volte sotto: evita ricalcolo (laziness, slide 04)
-
-    // Fase 1: shuffle leggero, solo (coppia, conteggio) -> niente List di date in giro
-    val counts: RDD[(CoordPair, Long)] =
-      perDate
-        .flatMap { case (_, cells) => PairsUtil.pairsOf(cells).map(p => (p, 1L)) }
-        .reduceByKey(_ + _)
-
-    val (winningPair, winningCount) = counts.reduce { (a, b) =>
-      if (a._2 > b._2) a else b
-    }
-
-    // Fase 2: solo per la coppia vincente, recupero le date (output limitato, collect sicuro)
-    val (coordA, coordB) = winningPair
-    val winningDates: List[LocalDate] =
-      perDate
-        .filter { case (_, cells) => cells.contains(coordA) && cells.contains(coordB) }
-        .map(_._1)
-        .collect()
-        .toList
-        .sorted
-
-    perDate.unpersist()
-    (winningPair, winningDates, winningCount.toInt)
-  }
-}
-
-object GroupByApproach extends CooccurrencyAnalysis {
-  def groupCells(data: RDD[EarthquakeType]): RDD[(LocalDate, Array[Coord])] =
-    data.groupByKey().mapValues(_.toArray.distinct)
-}
-
-object ReduceApproach extends CooccurrencyAnalysis {
-  def groupCells(data: RDD[EarthquakeType]): RDD[(LocalDate, Array[Coord])] =
-    data.mapValues(Array(_)).reduceByKey(_ ++ _).mapValues(_.distinct)
-}
-
-object FoldApproach extends CooccurrencyAnalysis {
-  def groupCells(data: RDD[EarthquakeType]): RDD[(LocalDate, Array[Coord])] =
-    data.mapValues(Array(_)).foldByKey(Array.empty[Coord])(_ ++ _).mapValues(_.distinct)
-}
-
-object AggregateApproach extends CooccurrencyAnalysis {
-  def groupCells(data: RDD[EarthquakeType]): RDD[(LocalDate, Array[Coord])] =
-    data
-      .aggregateByKey(scala.collection.mutable.ArrayBuffer.empty[Coord])(
-        (acc, coord) => acc += coord,
-        (acc1, acc2) => acc1 ++= acc2
-      )
-      .mapValues(_.distinct.toArray)
-}
-
-object CombineApproach extends CooccurrencyAnalysis {
-  def groupCells(data: RDD[EarthquakeType]): RDD[(LocalDate, Array[Coord])] =
-    data
-      .combineByKey(
-        (c: Coord) => scala.collection.mutable.ArrayBuffer(c),
-        (acc: scala.collection.mutable.ArrayBuffer[Coord], c: Coord) => acc += c,
-        (a1: scala.collection.mutable.ArrayBuffer[Coord], a2: scala.collection.mutable.ArrayBuffer[Coord]) => a1 ++= a2
-      )
-      .mapValues(_.distinct.toArray)
-}*/

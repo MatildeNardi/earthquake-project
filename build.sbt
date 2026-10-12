@@ -1,12 +1,13 @@
-ThisBuild / scalaVersion := "2.13.14"
+ThisBuild / scalaVersion := "2.12.18"
 ThisBuild / version := "0.1.0"
 
 lazy val root = (project in file("."))
   .settings(
     name := "earthquake-project",
+    scalacOptions ++= Seq("-release", "11"),
     libraryDependencies ++= Seq(
-      "org.apache.spark" %% "spark-core" % "3.5.1",
-      "org.apache.spark" %% "spark-sql"  % "3.5.1"
+      "org.apache.spark" %% "spark-core" % "3.5.3",
+      "org.apache.spark" %% "spark-sql"  % "3.5.3"
     ),
     // Solo per l'esecuzione locale con "sbt run"
     fork := true,

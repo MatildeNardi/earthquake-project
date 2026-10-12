@@ -1,26 +1,21 @@
 import Types.EarthquakeType
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.Row
 
-import java.time.{LocalDate, OffsetDateTime}
-import java.time.format.DateTimeFormatter
+import java.time.{LocalDate}
 
 
 object Types {
   type Coord = (Double, Double)
   type CoordPair = (Coord, Coord)
-  type Cooccurrency = (CoordPair, List[LocalDate], Int)
   type EarthquakeType = (LocalDate, Coord)
+  type Events = RDD[(LocalDate, Coord)]          // un evento = (giorno, cella)
+  type CoordsByDate  = RDD[(LocalDate, Array[Coord])]   // (giorno, celle distinte di quel giorno, ORDINATE)
 }
 
 object Earthquake {
 
-  // formatter creato UNA VOLTA per JVM/executor (Earthquake è un singleton),
-  // non una volta per riga: vedi discussione su ofPattern nel messaggio precedente
-  private val dateFormatter =
-    DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss[.SSSSSS]XXX")
-
-  private def formatDate(date: String): LocalDate =
-    OffsetDateTime.parse(date, dateFormatter).toLocalDate
+  private def formatDate(dateTime: String): LocalDate = LocalDate.parse(dateTime.trim.take(10))
 
   private def formatLonLat(l: String): Double =
     (l.toDouble * 10).round / 10.toDouble
