@@ -3,6 +3,7 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
 
 import java.time.LocalDate
+import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
 
@@ -18,22 +19,22 @@ object CooccurrencyAnalysis {
   def groupByDate(events: Events, grouping: String): CoordsByDate = {
     val grouped: CoordsByDate = grouping match {
       case "aggregate" =>
-        events.aggregateByKey(ArrayBuffer.empty[Coord])(
-          (buf, c) => buf += c,
-          (b1, b2) => b1 ++= b2
-        ).mapValues(_.toArray.distinct.sorted)
+        events.aggregateByKey(mutable.HashSet.empty[Coord])(
+          (set, c) => set += c,
+          (s1, s2) => s1 ++= s2
+        ).mapValues(_.toArray.sorted)
       case "combine" =>
         events.combineByKey(
-          (c: Coord) => ArrayBuffer(c),
-          (buf: ArrayBuffer[Coord], c: Coord) => buf += c,
-          (b1: ArrayBuffer[Coord], b2: ArrayBuffer[Coord]) => b1 ++= b2
-        ).mapValues(_.toArray.distinct.sorted)
-      case "distinct" => // duplicati eliminati PRIMA dello shuffle
+          (c: Coord) => mutable.HashSet(c),
+          (buf: mutable.HashSet[Coord], c: Coord) => buf += c,
+          (b1:  mutable.HashSet[Coord], b2:  mutable.HashSet[Coord]) => b1 ++= b2
+        ).mapValues(_.toArray.sorted)
+      case "distinct" =>
         events.distinct().groupByKey().mapValues(_.toArray.sorted)
       case _ => // "groupby"
         events.groupByKey().mapValues(_.toArray.distinct.sorted)
     }
-    grouped.filter(_._2.length > 1)
+    grouped.filter(_._2.length > 1) //remove element (dates) with only one coord -> no pairs of coordinates and so no co-occurrency possible
   }
 
 
@@ -118,6 +119,8 @@ object CooccurrencyAnalysis {
     val data  =  if (approach == "pruned")  pruneEvents(events, grouping, 200) else events
 
     val byDate = groupByDate(data, grouping).persist(StorageLevel.MEMORY_AND_DISK)
+    require(!byDate.isEmpty(), "Nessun giorno con almeno 2 celle: nessuna co-occorrenza")
+
     val (pair, count) = if (approach == "stripes") runStripes(byDate) else runPairs(byDate)
 
     val dates = byDate.filter { case (_, coords) => coords.contains(pair._1) && coords.contains(pair._2) }
