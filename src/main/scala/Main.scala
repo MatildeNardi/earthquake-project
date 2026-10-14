@@ -21,7 +21,6 @@ object Main {
       System.err.println(s"Raggruppamento sconosciuto: $grouping"); System.exit(1)
     }
 
-    // Il master lo decide spark-submit/Dataproc; in locale si imposta la variabile d'ambiente LOCAL
     val builder = SparkSession.builder().appName("Earthquake Application")
     val spark =
       if (sys.env.contains("LOCAL")) builder.master("local[*]").getOrCreate()
@@ -42,7 +41,7 @@ object Main {
 
     println(s"[INFO] partizioni di input: ${events.getNumPartitions}")
 
-    //CO-OCCURRENCY RESULT (winner pair, num of co-occurrency, list of dates)
+    //CO-OCCURRENCY RESULT (winner pair, num of co-occurrency, list of ordered dates)
     val (pair, count, dates) = CooccurrencyAnalysis.run(events, grouping, approach)
     val tEnd = System.currentTimeMillis()
 
