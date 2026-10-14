@@ -78,7 +78,7 @@ L'output stampa: il tempo totale, il numero di co-occorrenze, la coppia vincente
 
 Esempio:  
 ```bash
-sbt "run dataset-earthquakes-trimmed.csv pruned 8 combine"
+sbt "run data/dataset-earthquakes-trimmed.csv pruned 8 combine"
 ```
 
 ## Esecuzione su Google Cloud Dataproc
