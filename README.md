@@ -125,7 +125,7 @@ gcloud dataproc jobs submit spark \
   -- gs://$BUCKET/dataset-earthquakes-full.csv pruned 32 combine
 ```
 
-### 6. Eliminazione del cluster
+### 5. Eliminazione del cluster
 
 ```bash
 gcloud dataproc clusters delete eq-cluster --region=$REGION
