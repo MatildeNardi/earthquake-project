@@ -6,11 +6,11 @@ import java.time.{LocalDate}
 
 
 object Types {
-  type Coord = (Double, Double)
-  type CoordPair = (Coord, Coord)
+  type Coord = (Double, Double) //cell (location)
+  type CoordPair = (Coord, Coord) //pair of locations
   type EarthquakeType = (LocalDate, Coord)
-  type Events = RDD[(LocalDate, Coord)]          // un evento = (giorno, cella)
-  type CoordsByDate  = RDD[(LocalDate, Array[Coord])]   // (giorno, celle distinte di quel giorno, ORDINATE)
+  type Events = RDD[(LocalDate, Coord)]          // events = (date, cell)
+  type CoordsByDate  = RDD[(LocalDate, Array[Coord])]   // (date, all the corresponding cells)
 }
 
 object Earthquake {
@@ -20,7 +20,6 @@ object Earthquake {
   private def formatLonLat(l: String): Double =
     (l.toDouble * 10).round / 10.toDouble
 
-  // versione sicura: scarta righe malformate invece di far fallire il job
   def parseRow(row: Row): Option[EarthquakeType] = {
     try {
       val date = formatDate(row.getAs[String]("date"))

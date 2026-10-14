@@ -6,7 +6,7 @@ object Main {
   def main(args: Array[String]): Unit = {
     if (args.length < 2) {
       System.err.println(
-        "Uso: Main <input_path> <pairs|stripes|pruned> [num_partizioni|0] [groupby|aggregate|combine|distinct]")
+        "Uso: Main <input_path> <pairs|stripes|pruned> [num_partizioni|0] [groupby|aggregate|combine]")
       System.exit(1)
     }
     val inputPath = args(0)
@@ -17,7 +17,7 @@ object Main {
     if (!Set("pairs", "stripes", "pruned").contains(approach)) {
       System.err.println(s"Approccio sconosciuto: $approach"); System.exit(1)
     }
-    if (!Set("groupby", "aggregate", "combine", "distinct").contains(grouping)) {
+    if (!Set("groupby", "aggregate", "combine").contains(grouping)) {
       System.err.println(s"Raggruppamento sconosciuto: $grouping"); System.exit(1)
     }
 
