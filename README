@@ -76,7 +76,7 @@ sbt "run <input_path> <pairs|stripes|pruned> [num_partizioni] [groupby|aggregate
 
 L'output stampa: il tempo totale, il numero di co-occorrenze, la coppia vincente e la lista di date.
 
-Esempio:
+Esempio:  
 ```bash
 sbt "run dataset-earthquakes-trimmed.csv pruned 8 combine"
 ```
