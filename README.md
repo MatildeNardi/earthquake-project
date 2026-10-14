@@ -83,9 +83,14 @@ sbt "run dataset-earthquakes-trimmed.csv pruned 8 combine"
 
 ## Esecuzione su Google Cloud Dataproc
 
-I comandi si eseguono da Cloud Shell o da un terminale con `gcloud` installato e autenticato (`gcloud auth login`).
 
-### 1. Configurazione iniziale (una volta sola)
+### 1. Caricamento di JAR e dataset su Cloud Storage
+
+Prima di lanciare il programma su DataProc, compilare il JAR (vedi sez. precedente) e caricare il file su un bucket in Google Cloud Storage precedentemente creato.
+
+Nel bucket va caricato anche il dataset (file csv).
+
+### 2. Configurazione iniziale
 
 ```bash
 gcloud config set project <ID_PROGETTO>
@@ -96,11 +101,6 @@ export BUCKET=<nome-bucket>
 export REGION=europe-west1
 ```
 
-### 2. Caricamento di JAR e dataset su Cloud Storage
-
-Prima di lanciare il programma su DataProc, compilare il JAR (vedi sez. precedente) e caricare il file su un bucket in Google Cloud Storage precedentemente creato.
-
-Nel bucket va caricato anche il dataset (file csv).
 
 ### 3. Creazione del cluster
 
